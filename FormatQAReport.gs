@@ -47,7 +47,6 @@ var CFG = {
   ISSUE_SPACE_BEFORE: 10,
   ISSUE_SPACE_AFTER: 6,
   HEADER_TEXT: 'QA Issue Report – Admin User POS',
-  DATE_LABEL: '4–5 Nov',
   FOOTER_TEXT: 'Internal – QA findings'   // page numbers: Insert > Page numbers
 };
 
@@ -78,7 +77,7 @@ function formatQAReport() {
 
 /** Runs the formatting straight from the editor with the default choices (no window). */
 function formatWithDefaults() {
-  var r = applyFormatting({ listType: 'NUMBER', dividers: true, fitImages: false, pageBg: true, bgColor: CFG.PAGE_BG, accent: CFG.ACCENT });
+  var r = applyFormatting({ listType: 'NUMBER', dividers: true, fitImages: false, pageBg: true, bgColor: CFG.PAGE_BG, accent: CFG.ACCENT, makeTabs: false });
   Logger.log(r);
 }
 
@@ -100,9 +99,14 @@ function applyFormatting(opts) {
   var docId = doc.getId();
   var body = doc.getBody();
   var failed = [];
+  var issueBlocks = opts.makeTabs ? collectIssueBlocks_(body) : [];
   function step(name, fn) {          // one failing step must not stop the others
     try { fn(); Logger.log('OK      ' + name); }
-    catch (e) { failed.push(name); Logger.log('FAILED  ' + name + ' -> ' + e); }
+    catch (e) {
+      var message = e && e.message ? e.message : String(e);
+      failed.push(name + ' (' + message + ')');
+      Logger.log('FAILED  ' + name + ' -> ' + message);
+    }
   }
 
   var issueCount = countIssues_(body);
@@ -117,6 +121,7 @@ function applyFormatting(opts) {
 
   doc.saveAndClose();
   step('issue status dropdowns', function () { addIssueStatusDropdowns_(docId); });
+  if (opts.makeTabs) step('document tabs', function () { createIssueTabs_(docId, issueBlocks); });
   if (opts.pageBg) setPageBackground_(docId, bgColor);
   return failed.length ? ('Finished, but these steps failed: ' + failed.join(', ') + '. See View > Logs in the script editor.') : 'done';
 }
@@ -168,16 +173,26 @@ function addIssueStatusDropdowns_(docId) {
   var issueElements = [];
   var deleteRequests = [];
   var issueStatuses = [];
-  state.content.forEach(function (item) {
+  var statusLineExists = [];
+  state.content.forEach(function (item, itemIndex) {
     if (!item.paragraph || !item.paragraph.bullet) return;
     issueElements.push(item);
 
     var dropdown = (item.paragraph.elements || []).filter(function (element) {
       return !!element.dropdown;
     })[0];
+    var followingItem = state.content[itemIndex + 1];
+    var followingDropdown = null;
+    if (!dropdown && followingItem && followingItem.paragraph &&
+        !followingItem.paragraph.bullet) {
+      followingDropdown = (followingItem.paragraph.elements || []).filter(function (element) {
+        return !!element.dropdown;
+      })[0] || null;
+    }
     var status = options[0].displayValue;
-    if (dropdown) {
-      var props = dropdown.dropdown.dropdownProperties || {};
+    var existingDropdown = dropdown || followingDropdown;
+    if (existingDropdown) {
+      var props = existingDropdown.dropdown.dropdownProperties || {};
       var definition = definitionMap[props.dropdownDefinitionId];
       var definitionOptions = definition &&
         definition.dropdownDefinitionProperties &&
@@ -190,6 +205,8 @@ function addIssueStatusDropdowns_(docId) {
           break;
         }
       }
+    }
+    if (dropdown) {
       deleteRequests.push({
         deleteContentRange: {
           range: {
@@ -200,6 +217,7 @@ function addIssueStatusDropdowns_(docId) {
       });
     }
     issueStatuses.push(status);
+    statusLineExists.push(!!followingDropdown);
   });
 
   if (!issueElements.length) return 'No numbered issue list items were found.';
@@ -212,6 +230,72 @@ function addIssueStatusDropdowns_(docId) {
     docsApiRequest_(api + ':batchUpdate', 'post', token, {
       requests: deleteRequests
     });
+  }
+
+  state = readDocState();
+  var splitImageRequests = [];
+  var splitImageIndexes = [];
+  state.content.forEach(function (item) {
+    if (!item.paragraph || !item.paragraph.bullet) return;
+    var elements = item.paragraph.elements || [];
+    var image = null;
+    var hasTextBeforeImage = false;
+    for (var i = 0; i < elements.length; i++) {
+      var element = elements[i];
+      if (element.inlineObjectElement) {
+        image = element;
+        break;
+      }
+      if (element.textRun && /\S/.test(element.textRun.content)) {
+        hasTextBeforeImage = true;
+      }
+    }
+    if (image && hasTextBeforeImage) {
+      splitImageIndexes.push(image.startIndex);
+      splitImageRequests.push({
+        insertText: {
+          location: { index: image.startIndex },
+          text: '\n'
+        }
+      });
+    }
+  });
+  splitImageRequests.sort(function (a, b) {
+    return b.insertText.location.index - a.insertText.location.index;
+  });
+  if (splitImageRequests.length) {
+    docsApiRequest_(api + ':batchUpdate', 'post', token, {
+      requests: splitImageRequests
+    });
+
+    state = readDocState();
+    var continuationBulletRanges = [];
+    var continuationStarts = {};
+    splitImageIndexes.forEach(function (index) {
+      var precedingSplits = splitImageIndexes.filter(function (otherIndex) {
+        return otherIndex < index;
+      }).length;
+      continuationStarts[index + 1 + precedingSplits] = true;
+    });
+    state.content.forEach(function (item) {
+      if (!item.paragraph || !item.paragraph.bullet) return;
+      if (continuationStarts[item.startIndex]) {
+        continuationBulletRanges.push({
+          startIndex: item.startIndex,
+          endIndex: item.endIndex
+        });
+      }
+    });
+    continuationBulletRanges.sort(function (a, b) {
+      return b.startIndex - a.startIndex;
+    });
+    if (continuationBulletRanges.length) {
+      docsApiRequest_(api + ':batchUpdate', 'post', token, {
+        requests: continuationBulletRanges.map(function (range) {
+          return { deleteParagraphBullets: { range: range } };
+        })
+      });
+    }
   }
 
   var dropdownDefinitionId = null;
@@ -259,44 +343,30 @@ function addIssueStatusDropdowns_(docId) {
   var statusIndex = 0;
   state.content.forEach(function (item) {
     if (!item.paragraph || !item.paragraph.bullet) return;
-    var elements = item.paragraph.elements || [];
-    var image = null;
-    for (var i = 0; i < elements.length; i++) {
-      if (elements[i].inlineObjectElement) {
-        image = elements[i];
-        break;
-      }
+    if (!statusLineExists[statusIndex]) {
+      insertionPlans.push({
+        index: item.endIndex - 1,
+        statusOptionId: desiredByName[issueStatuses[statusIndex]]
+      });
     }
-
-    var index = image ? image.startIndex : item.endIndex - 1;
-    var needsSpace = true;
-    for (var j = 0; j < elements.length; j++) {
-      var element = elements[j];
-      if (!element.textRun || element.endIndex > index) continue;
-      var precedingText = element.textRun.content.replace(/[\r\n]+$/, '');
-      if (/\s$/.test(precedingText)) needsSpace = false;
-    }
-    insertionPlans.push({
-      index: index,
-      needsSpace: needsSpace,
-      statusOptionId: desiredByName[issueStatuses[statusIndex]]
-    });
     statusIndex++;
   });
 
   insertionPlans.sort(function (a, b) { return b.index - a.index; });
   var insertRequests = [];
   insertionPlans.forEach(function (plan) {
-    var index = plan.index;
-    if (plan.needsSpace) {
-      insertRequests.push({
-        insertText: { location: { index: index }, text: ' ' }
-      });
-      index++;
-    }
+    var statusIndex = plan.index + 1;
+    insertRequests.push({
+      insertText: { location: { index: plan.index }, text: '\n' }
+    });
+    insertRequests.push({
+      deleteParagraphBullets: {
+        range: { startIndex: statusIndex, endIndex: statusIndex + 1 }
+      }
+    });
     insertRequests.push({
       insertDropdown: {
-        location: { index: index },
+        location: { index: statusIndex },
         dropdownDefinitionId: dropdownDefinitionId,
         selectedOptionId: plan.statusOptionId
       }
@@ -306,8 +376,139 @@ function addIssueStatusDropdowns_(docId) {
   docsApiRequest_(api + ':batchUpdate', 'post', token, {
     requests: insertRequests
   });
-  return 'Positioned status dropdowns after the issue text for ' +
+  return 'Positioned status dropdowns beneath the issue text for ' +
     issueElements.length + ' issue(s).';
+}
+
+function collectIssueBlocks_(body) {
+  var blocks = [];
+  var current = null;
+  for (var i = 0; i < body.getNumChildren(); i++) {
+    var child = body.getChild(i);
+    var type = child.getType();
+
+    if (type === DocumentApp.ElementType.LIST_ITEM) {
+      if (current) blocks.push(current);
+      current = { title: child.asListItem().getText().replace(/\s+/g, ' ').trim(), lines: [] };
+      continue;
+    }
+    if (!current) continue;
+
+    if (type === DocumentApp.ElementType.PARAGRAPH) {
+      var paragraphText = child.asParagraph().getText().replace(/\s+$/, '');
+      if (paragraphText) current.lines.push(paragraphText);
+    } else if (type === DocumentApp.ElementType.TABLE) {
+      var table = child.asTable();
+      var tableLines = [];
+      for (var r = 0; r < table.getNumRows(); r++) {
+        var row = table.getRow(r);
+        var rowParts = [];
+        for (var c = 0; c < row.getNumCells(); c++) {
+          var cellText = row.getCell(c).getText().replace(/\s+/g, ' ').trim();
+          if (cellText) rowParts.push(cellText);
+          if (tableCellHasImage_(row.getCell(c))) rowParts.push('[Screenshot]');
+        }
+        if (rowParts.length) tableLines.push(rowParts.join(' | '));
+      }
+      if (tableLines.length) current.lines.push(tableLines.join('\n'));
+    }
+  }
+  if (current) blocks.push(current);
+  return blocks;
+}
+
+function tableCellHasImage_(cell) {
+  for (var i = 0; i < cell.getNumChildren(); i++) {
+    var child = cell.getChild(i);
+    if (child.getType() === DocumentApp.ElementType.PARAGRAPH &&
+        containsImage_(child.asParagraph())) return true;
+  }
+  return false;
+}
+
+function createIssueTabs_(docId, issueBlocks) {
+  if (!issueBlocks || !issueBlocks.length) return;
+
+  var api = 'https://docs.googleapis.com/v1/documents/' + encodeURIComponent(docId);
+  var token = ScriptApp.getOAuthToken();
+
+  function readTabs() {
+    var document = docsApiRequest_(api + '?includeTabsContent=true', 'get', token);
+    var byTitle = {};
+    var endIndexes = {};
+    (document.tabs || []).forEach(function (tab) {
+      var props = tab.tabProperties || {};
+      var documentTab = tab.documentTab || {};
+      var tabBody = documentTab.body || {};
+      var content = tabBody.content || [];
+      if (props.title) byTitle[props.title] = props.tabId;
+      if (props.tabId) {
+        endIndexes[props.tabId] = content.length
+          ? (content[content.length - 1].endIndex || 1)
+          : 1;
+      }
+    });
+    return {
+      tabs: document.tabs || [],
+      byTitle: byTitle,
+      endIndexes: endIndexes
+    };
+  }
+
+  var state = readTabs();
+  var addRequests = [];
+  issueBlocks.forEach(function (block, index) {
+    var title = 'Issue ' + (index + 1);
+    if (block.title) {
+      title += ': ' + block.title;
+    }
+    if (title.length > 50) title = title.substr(0, 47) + '...';
+    block.tabTitle = title;
+    if (!state.byTitle[title]) {
+      addRequests.push({
+        addDocumentTab: {
+          tabProperties: { title: title }
+        }
+      });
+    }
+  });
+
+  if (addRequests.length) {
+    docsApiRequest_(api + ':batchUpdate', 'post', token, { requests: addRequests });
+  }
+
+  state = readTabs();
+  var clearRequests = [];
+  var insertRequests = [];
+  issueBlocks.forEach(function (block) {
+    var tabId = state.byTitle[block.tabTitle];
+    if (!tabId) return;
+    var endIndex = state.endIndexes[tabId] || 1;
+    if (endIndex > 2) {
+      clearRequests.push({
+        deleteContentRange: {
+          range: { tabId: tabId, startIndex: 1, endIndex: endIndex - 1 }
+        }
+      });
+    }
+
+    var text = block.title;
+    if (block.lines.length) text += '\n\n' + block.lines.join('\n\n');
+    text += '\n';
+    insertRequests.push({
+      insertText: {
+        location: { tabId: tabId, index: 1 },
+        text: text
+      }
+    });
+  });
+
+  if (clearRequests.length) {
+    docsApiRequest_(api + ':batchUpdate', 'post', token, { requests: clearRequests });
+  }
+  if (insertRequests.length) {
+    docsApiRequest_(api + ':batchUpdate', 'post', token, { requests: insertRequests });
+  }
 }
 
 function docsApiRequest_(url, method, token, payload) {
@@ -365,6 +566,10 @@ function buildDialogHtml_() {
   '<option value="ROMAN_LOWER">i. ii. iii. – Roman small</option>' +
   '</select></fieldset>' +
 
+  '<fieldset><legend>Document tabs</legend>' +
+  '<label><input type="radio" name="tabs" value="1"> Yes, create one tab per numbered issue</label>' +
+  '<label><input type="radio" name="tabs" value="0" checked> No, keep everything in the main tab</label></fieldset>' +
+
   '<fieldset><legend>Separator line between issues</legend>' +
   '<label><input type="radio" name="div" value="1" checked> Yes, add a thin line</label>' +
   '<label><input type="radio" name="div" value="0"> No lines</label></fieldset>' +
@@ -393,7 +598,7 @@ function buildDialogHtml_() {
   'function toggleBg(){document.getElementById("bgbox").className=(val("bg")==="1")?"":"off";}' +
   'function go(){var b=document.getElementById("go");b.disabled=true;b.textContent="Formatting… please wait";' +
   'var o={listType:document.getElementById("listType").value,dividers:val("div")==="1",fitImages:val("img")==="1",pageBg:val("bg")==="1",' +
-  'bgColor:document.getElementById("bgColor").value,accent:document.getElementById("accent").value};' +
+  'bgColor:document.getElementById("bgColor").value,accent:document.getElementById("accent").value,makeTabs:val("tabs")==="1"};' +
   'google.script.run.withSuccessHandler(function(r){if(r==="done"||r==="opened-dialog"){google.script.host.close();}else{b.disabled=false;b.textContent="Format document";document.getElementById("msg").textContent=r;}})' +
   '.withFailureHandler(function(e){b.disabled=false;b.textContent="Format document";document.getElementById("msg").textContent="Error: "+e.message;})' +
   '.applyFormatting(o);}' +
@@ -494,7 +699,7 @@ function buildBanner_(body, issueCount) {
   ts[DocumentApp.Attribute.FOREGROUND_COLOR] = '#FFFFFF';
   tp.setAttributes(ts);
 
-  var sub = cell.appendParagraph(issueCount + ' issues found  •  ' + CFG.DATE_LABEL + '  •  Reported by QA');
+  var sub = cell.appendParagraph(issueCount + ' issues found  •  Reported by QA');
   sub.setIndentStart(0).setIndentFirstLine(0).setSpacingBefore(0).setSpacingAfter(0);
   var ss = {};
   ss[DocumentApp.Attribute.FONT_FAMILY] = CFG.FONT;
@@ -715,7 +920,7 @@ function addHeaderFooter_(doc) {
   var header = doc.getHeader() || doc.addHeader();
   header.clear();
   var hp = header.getParagraphs()[0] || header.appendParagraph('');
-  hp.setText(CFG.HEADER_TEXT + '   |   ' + CFG.DATE_LABEL);
+  hp.setText(CFG.HEADER_TEXT);
   hp.setAlignment(DocumentApp.HorizontalAlignment.RIGHT);
   hp.setAttributes(small_(9, CFG.ACCENT, true));
 
