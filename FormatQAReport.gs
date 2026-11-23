@@ -607,8 +607,9 @@ function copyIssueFilterBatch(jobId, issueBatch) {
     if (!Array.isArray(issueBatch) || !issueBatch.length) {
       throw new Error('The issue filter received an empty batch.');
     }
+    var batchStart = job.processed;
     issueBatch.forEach(function (issue, batchIndex) {
-      if (issue.copyOrder !== job.processed + batchIndex ||
+      if (issue.copyOrder !== batchStart + batchIndex ||
           normalizeIssueStatus_(issue.status) !== normalizeIssueStatus_(job.status)) {
         throw new Error('Issue filter progress is out of sequence. Restart the filter.');
       }
